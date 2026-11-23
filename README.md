@@ -18,7 +18,7 @@ A small command-line tool that converts a list of chemical compound names into S
 ## Installation
  
 ```bash
-git clone https://github.com/<your-username>/names-to-smiles.git
+git clone https://github.com/Thunder-Storm67/names-to-smiles.git
 cd names-to-smiles
 pip install requests
 ```
