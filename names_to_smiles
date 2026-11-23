@@ -1,1 +1,180 @@
+#!/usr/bin/env python3
+"""
+names_to_smiles.py
+Read chemical compound names from a text file (one per line) and write their
+SMILES (plus a few useful properties) to a CSV file.
 
+Lookup order:
+  1. PubChem PUG REST   (primary; returns CID, SMILES, formula, weight)
+  2. NCI CACTUS resolver (fallback for names PubChem does not recognise)
+
+Usage:
+    python names_to_smiles.py compounds.txt
+    python names_to_smiles.py compounds.txt -o results.csv --delay 0.25
+
+Input format (compounds.txt):
+    aspirin
+    caffeine
+    # lines starting with '#' are ignored
+    2-acetoxybenzoic acid
+
+Requires:  pip install requests
+"""
+
+import argparse
+import csv
+import sys
+import time
+from pathlib import Path
+from urllib.parse import quote
+
+import requests
+
+PUBCHEM_URL = (
+    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{name}"
+    "/property/SMILES,ConnectivitySMILES,MolecularFormula,MolecularWeight,IUPACName/JSON"
+)
+CACTUS_URL = "https://cactus.nci.nih.gov/chemical/structure/{name}/smiles"
+
+CSV_FIELDS = [
+    "name",
+    "status",
+    "source",
+    "cid",
+    "smiles",
+    "connectivity_smiles",
+    "formula",
+    "molecular_weight",
+    "iupac_name",
+]
+
+
+def read_names(path: Path) -> list[str]:
+    """Read names, skipping blanks/comments and removing duplicates (order kept)."""
+    seen, names = set(), []
+    with path.open(encoding="utf-8-sig") as f:
+        for line in f:
+            name = line.strip()
+            if not name or name.startswith("#"):
+                continue
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                names.append(name)
+    return names
+
+
+def get_with_retry(session: requests.Session, url: str, retries: int = 3, timeout: int = 20):
+    """GET with simple retry/backoff for transient errors and rate limiting."""
+    resp = None
+    for attempt in range(retries):
+        try:
+            resp = session.get(url, timeout=timeout)
+        except requests.RequestException:
+            time.sleep(2 ** attempt)
+            continue
+        # PubChem returns 503 when busy and 429 when rate limited
+        if resp.status_code in (429, 500, 502, 503, 504):
+            time.sleep(2 ** attempt)
+            continue
+        return resp
+    return resp
+
+
+def lookup_pubchem(session: requests.Session, name: str):
+    resp = get_with_retry(session, PUBCHEM_URL.format(name=quote(name, safe="")))
+    if resp is None or resp.status_code != 200:
+        return None
+    try:
+        props = resp.json()["PropertyTable"]["Properties"][0]
+    except (ValueError, KeyError, IndexError):
+        return None
+
+    # PubChem renamed fields in 2023; accept both old and new names.
+    smiles = props.get("SMILES") or props.get("IsomericSMILES") or props.get("CanonicalSMILES")
+    connectivity = props.get("ConnectivitySMILES") or props.get("CanonicalSMILES")
+    if not smiles:
+        return None
+    return {
+        "source": "PubChem",
+        "cid": props.get("CID", ""),
+        "smiles": smiles,
+        "connectivity_smiles": connectivity or "",
+        "formula": props.get("MolecularFormula", ""),
+        "molecular_weight": props.get("MolecularWeight", ""),
+        "iupac_name": props.get("IUPACName", ""),
+    }
+
+
+def lookup_cactus(session: requests.Session, name: str):
+    resp = get_with_retry(session, CACTUS_URL.format(name=quote(name, safe="")))
+    if resp is None or resp.status_code != 200:
+        return None
+    smiles = resp.text.strip().splitlines()[0].strip() if resp.text.strip() else ""
+    if not smiles:
+        return None
+    return {
+        "source": "NCI CACTUS",
+        "cid": "",
+        "smiles": smiles,
+        "connectivity_smiles": "",
+        "formula": "",
+        "molecular_weight": "",
+        "iupac_name": "",
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Convert compound names to SMILES via online services.")
+    parser.add_argument("input", type=Path, help="Text file with one compound name per line")
+    parser.add_argument("-o", "--output", type=Path, default=None,
+                        help="Output CSV path (default: <input>_smiles.csv)")
+    parser.add_argument("--delay", type=float, default=0.25,
+                        help="Seconds to wait between requests (PubChem allows ~5 req/s)")
+    args = parser.parse_args()
+
+    if not args.input.is_file():
+        print(f"Input file not found: {args.input}", file=sys.stderr)
+        return 1
+
+    output = args.output or args.input.with_name(args.input.stem + "_smiles.csv")
+    names = read_names(args.input)
+    if not names:
+        print("No compound names found in input file.", file=sys.stderr)
+        return 1
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "names-to-smiles-script/1.0"})
+
+    found = 0
+    with output.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+
+        for i, name in enumerate(names, start=1):
+            result = lookup_pubchem(session, name)
+            time.sleep(args.delay)
+            if result is None:
+                result = lookup_cactus(session, name)
+                time.sleep(args.delay)
+
+            row = {k: "" for k in CSV_FIELDS}
+            row["name"] = name
+            if result:
+                row.update(result)
+                row["status"] = "found"
+                found += 1
+            else:
+                row["status"] = "not_found"
+
+            writer.writerow(row)
+            f.flush()  # keep partial results if the run is interrupted
+            print(f"[{i}/{len(names)}] {name}: {row['status']}"
+                  + (f" ({row['source']})" if result else ""))
+
+    print(f"\nDone. {found}/{len(names)} resolved. Output: {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
